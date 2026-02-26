@@ -2,7 +2,7 @@ import secrets
 import hashlib
 from typing import Optional, Dict
 from datetime import datetime
-from models import execute_query, get_tenant_by_api_key, check_rate_limit, increment_usage, log_usage
+from models import execute_query, get_tenant_by_api_key, check_rate_limit, log_usage
 
 def generate_api_key() -> str:
     """Generate a secure API key"""
@@ -26,17 +26,21 @@ def verify_api_key(api_key: str) -> Optional[Dict]:
     if not tenant:
         return None
     
-    # Check rate limit
-    if not check_rate_limit(tenant['id']):
+    # Check rate limit with billing info
+    allowed, rate_info = check_rate_limit(tenant['id'])
+    
+    if not allowed:
         return {
-            'error': 'rate_limit_exceeded',
-            'message': 'Rate limit exceeded. Please upgrade your plan or try again later.',
-            'tenant': tenant
+            'error': rate_info.get('error', 'rate_limit_exceeded'),
+            'rate_info': rate_info,
+            'tenant': {k: v for k, v in tenant.items() if k != 'api_key'}
         }
     
     # Log usage
     log_usage(tenant['id'], 'api_call', 'authentication')
-    increment_usage(tenant['id'])
+    
+    # Add rate info to tenant dict
+    tenant['rate_info'] = rate_info
     
     return tenant
 
