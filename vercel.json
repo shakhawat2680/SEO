@@ -1,0 +1,24 @@
+{
+  "functions": {
+    "app.py": {
+      "runtime": "python3.9",
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "app.py"
+    }
+  ],
+  "builds": [
+    {
+      "src": "app.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "env": {
+    "ENVIRONMENT": "production"
+  }
+}
