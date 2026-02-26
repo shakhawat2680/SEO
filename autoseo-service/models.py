@@ -404,4 +404,76 @@ def get_tenant_stats(tenant_id: str) -> dict:
             'period': current_cycle,
             'usage': cycle_usage
         },
-        'previous
+        'previous_cycle_usage': previous_usage,
+        'daily_activity': [{'date': r[0], 'count': r[1]} for r in daily],
+        'billing_history': [{
+            'period': f"{r[0][:7]} to {r[1][:7]}",
+            'usage': r[2],
+            'overage': r[3],
+            'status': r[4],
+            'payment_date': r[5]
+        } for r in history]
+    }
+
+def update_tenant_plan(tenant_id: str, plan_type: str, billing_cycle: str = None):
+    """Update tenant plan and rate limit"""
+    plan = execute_query(
+        "SELECT rate_limit FROM plans WHERE id = ?",
+        (plan_type,),
+        fetch=True
+    )
+    
+    if not plan:
+        return False
+    
+    rate_limit = plan[0][0]
+    updates = ["plan_type = ?", "rate_limit = ?", "updated_at = ?"]
+    params = [plan_type, rate_limit, datetime.now().isoformat()]
+    
+    if billing_cycle:
+        updates.append("billing_cycle = ?")
+        params.append(billing_cycle)
+    
+    params.append(tenant_id)
+    
+    execute_query(
+        f"UPDATE tenants SET {', '.join(updates)} WHERE id = ?",
+        tuple(params)
+    )
+    
+    return True
+
+def calculate_overage_charges(tenant_id: str, cycle: str = None) -> dict:
+    """Calculate overage charges for a billing cycle"""
+    if not cycle:
+        cycle = get_current_billing_cycle()
+    
+    tenant = get_tenant(tenant_id)
+    if not tenant:
+        return {}
+    
+    usage = get_cycle_usage(tenant_id, cycle)
+    
+    if usage <= tenant['rate_limit']:
+        return {'overage': 0, 'charge': 0}
+    
+    overage = usage - tenant['rate_limit']
+    
+    plan = execute_query(
+        "SELECT overage_rate FROM plans WHERE id = ?",
+        (tenant['plan_type'],),
+        fetch=True
+    )
+    
+    overage_rate = plan[0][0] if plan else 0
+    overage_blocks = (overage + 99) // 100
+    charge = overage_blocks * overage_rate
+    
+    return {
+        'usage': usage,
+        'limit': tenant['rate_limit'],
+        'overage': overage,
+        'overage_blocks': overage_blocks,
+        'rate_per_block': overage_rate,
+        'total_charge': charge
+    }
