@@ -1,25 +1,18 @@
-"""
-Vercel serverless entry point
-"""
+from fastapi import FastAPI
+from mangum import Mangum
 import sys
 import os
 from pathlib import Path
 
-# Add parent directory to path so imports work
+# Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-# Import the FastAPI app
+# Import your app
 from app import app
 
-# Import mangum for ASGI wrapper
-try:
-    from mangum import Mangum
-    # Create handler for Vercel
-    handler = Mangum(app)
-except ImportError:
-    # Fallback for local development
-    def handler(event, context):
-        return {
-            "statusCode": 500,
-            "body": "Mangum not installed"
-        }
+# Create handler for Vercel
+handler = Mangum(app)
+
+# This is for Vercel
+def handler(event, context):
+    return Mangum(app)(event, context)
