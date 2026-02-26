@@ -17,16 +17,12 @@ def verify_api_key(api_key: str) -> Optional[Dict]:
     if not api_key or not api_key.startswith('aseo_'):
         return None
     
-    # Hash the provided key
     key_hash = hash_api_key(api_key)
-    
-    # Get tenant
     tenant = get_tenant_by_api_key(key_hash)
     
     if not tenant:
         return None
     
-    # Check rate limit with billing info
     allowed, rate_info = check_rate_limit(tenant['id'])
     
     if not allowed:
@@ -36,10 +32,7 @@ def verify_api_key(api_key: str) -> Optional[Dict]:
             'tenant': {k: v for k, v in tenant.items() if k != 'api_key'}
         }
     
-    # Log usage
     log_usage(tenant['id'], 'api_call', 'authentication')
-    
-    # Add rate info to tenant dict
     tenant['rate_info'] = rate_info
     
     return tenant
