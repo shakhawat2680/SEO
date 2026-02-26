@@ -5,6 +5,7 @@ from datetime import datetime
 import uuid
 from typing import Optional, List, Dict
 import json
+import os
 
 from crawler import Crawler
 from analyzer import SEOAnalyzer
@@ -15,7 +16,12 @@ from models import (
 )
 from auth import verify_api_key, generate_api_key, log_usage
 
-app = FastAPI(title="AutoSEO Service - Multi-Tenant with Billing")
+# Initialize FastAPI
+app = FastAPI(
+    title="AutoSEO Service",
+    description="Multi-tenant SEO automation service",
+    version="1.0.0"
+)
 
 # CORS
 app.add_middleware(
@@ -25,8 +31,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize database
-init_db()
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    try:
+        init_db()
+        print(f"✅ Database initialized at {datetime.now().isoformat()}")
+        print(f"✅ Environment: {os.environ.get('ENVIRONMENT', 'development')}")
+        if os.environ.get('VERCEL'):
+            print("✅ Running on Vercel serverless")
+    except Exception as e:
+        print(f"❌ Database init error: {e}")
 
 # Models
 class SiteRequest(BaseModel):
@@ -57,7 +72,7 @@ class TenantRequest(BaseModel):
     name: str
     email: str
     plan_type: str = "free"
-    billing_cycle: str = "monthly"  # monthly, yearly
+    billing_cycle: str = "monthly"
 
 class TenantResponse(BaseModel):
     id: str
@@ -102,7 +117,8 @@ class BillingHistoryResponse(BaseModel):
     payment_date: Optional[str]
 
 # Dependency with enhanced error handling
-async def get_tenant(api_key: str = Header(..., alias="X-API-Key")):
+async def get_current_tenant(api_key: str = Header(..., alias="X-API-Key")):
+    """Get current tenant from API key"""
     result = verify_api_key(api_key)
     
     if not result:
@@ -114,7 +130,7 @@ async def get_tenant(api_key: str = Header(..., alias="X-API-Key")):
         
         if error == 'subscription_inactive':
             raise HTTPException(
-                status_code=402,  # Payment Required
+                status_code=402,
                 detail={
                     "error": "subscription_inactive",
                     "message": "Your subscription is inactive. Please update payment method.",
@@ -137,58 +153,70 @@ async def get_tenant(api_key: str = Header(..., alias="X-API-Key")):
     
     return result
 
-# Public endpoints
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "service": "AutoSEO Service",
+        "version": "1.0.0",
+        "environment": os.environ.get('ENVIRONMENT', 'development'),
+        "serverless": bool(os.environ.get('VERCEL')),
+        "timestamp": datetime.now().isoformat(),
+        "endpoints": {
+            "GET /health": "Health check",
+            "POST /tenants": "Register new tenant",
+            "POST /sites": "Add website",
+            "GET /sites": "List websites",
+            "GET /usage": "Check usage",
+            "GET /dashboard": "View dashboard"
+        },
+        "documentation": "/docs"
+    }
+
+# Health check
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    try:
+        execute_query("SELECT 1", fetch=True)
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {e}"
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "database": db_status,
+        "environment": os.environ.get('ENVIRONMENT', 'development'),
+        "serverless": bool(os.environ.get('VERCEL')),
+        "version": "1.0.0"
+    }
+
+# Tenant registration
 @app.post("/tenants", response_model=TenantResponse)
 async def create_tenant(tenant: TenantRequest):
     """Register a new tenant (client)"""
-    tenant_id = str(uuid.uuid4())
-    api_key = generate_api_key()
+    from tenant import create_tenant as create_new_tenant
     
-    # Get plan rate limit
-    plan = execute_query(
-        "SELECT rate_limit FROM plans WHERE id = ?",
-        (tenant.plan_type,),
-        fetch=True
-    )
-    rate_limit = plan[0][0] if plan else 100
-    
-    execute_query(
-        """INSERT INTO tenants (
-            id, name, email, api_key, plan_type, billing_cycle, 
-            rate_limit, created_at, subscription_status
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (tenant_id, tenant.name, tenant.email, api_key, tenant.plan_type, 
-         tenant.billing_cycle, rate_limit, datetime.now().isoformat(), 'active')
+    result = create_new_tenant(
+        name=tenant.name,
+        email=tenant.email,
+        plan_type=tenant.plan_type,
+        billing_cycle=tenant.billing_cycle
     )
     
-    # Initialize billing
-    from models import initialize_tenant_billing
-    initialize_tenant_billing(tenant_id, tenant.plan_type, tenant.billing_cycle)
+    if not result:
+        raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Get complete tenant data
-    result = get_tenant(tenant_id)
-    
-    return {
-        "id": result['id'],
-        "name": result['name'],
-        "email": result['email'],
-        "plan_type": result['plan_type'],
-        "billing_cycle": result['billing_cycle'],
-        "usage_count": result['usage_count'],
-        "rate_limit": result['rate_limit'],
-        "api_key": api_key,
-        "created_at": result['created_at'],
-        "billing_start": result['billing_start'],
-        "billing_end": result['billing_end'],
-        "subscription_status": result['subscription_status']
-    }
+    return result
 
-# Protected endpoints
+# Add site
 @app.post("/sites", response_model=SiteResponse)
 async def add_site(
-    site: SiteRequest, 
+    site: SiteRequest,
     background_tasks: BackgroundTasks,
-    tenant: dict = Depends(get_tenant)
+    tenant: dict = Depends(get_current_tenant)
 ):
     """Add a new site for SEO monitoring"""
     site_id = str(uuid.uuid4())
@@ -206,14 +234,14 @@ async def add_site(
     execute_query(
         """INSERT INTO sites (id, tenant_id, url, name, settings, created_at, status, audit_count) 
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (site_id, tenant['id'], site.url, site.name or site.url, 
+        (site_id, tenant['id'], site.url, site.name or site.url,
          json.dumps(site.settings), datetime.now().isoformat(), 'pending', 0)
     )
     
     # Log usage
     log_usage(tenant['id'], 'add_site', site_id)
     
-    # Start audit
+    # Start audit in background (note: background tasks on Vercel have limitations)
     background_tasks.add_task(run_audit, site_id, site.url, tenant['id'])
     
     return {
@@ -228,12 +256,115 @@ async def add_site(
         "audit_count": 0
     }
 
-@app.get("/usage", response_model=UsageResponse)
-async def get_usage(tenant: dict = Depends(get_tenant)):
-    """Get detailed usage with billing info"""
-    from models import get_tenant_stats, calculate_overage_charges
+# List sites
+@app.get("/sites", response_model=List[SiteResponse])
+async def list_sites(tenant: dict = Depends(get_current_tenant)):
+    """List all sites for this tenant"""
+    from tenant import get_tenant_sites
+    sites = get_tenant_sites(tenant['id'])
     
-    stats = get_tenant_stats(tenant['id'])
+    # Log usage
+    log_usage(tenant['id'], 'list_sites')
+    
+    return sites
+
+# Get single site
+@app.get("/sites/{site_id}", response_model=SiteResponse)
+async def get_site(site_id: str, tenant: dict = Depends(get_current_tenant)):
+    """Get site details"""
+    results = execute_query(
+        """SELECT id, url, name, tenant_id, created_at, status, last_score, 
+                  last_audit, audit_count 
+           FROM sites WHERE id = ? AND tenant_id = ?""",
+        (site_id, tenant['id']),
+        fetch=True
+    )
+    
+    if not results:
+        raise HTTPException(status_code=404, detail="Site not found")
+    
+    r = results[0]
+    
+    # Log usage
+    log_usage(tenant['id'], 'get_site', site_id)
+    
+    return {
+        "id": r[0],
+        "url": r[1],
+        "name": r[2],
+        "tenant_id": r[3],
+        "created_at": r[4],
+        "status": r[5],
+        "last_score": r[6],
+        "last_audit": r[7],
+        "audit_count": r[8] or 0
+    }
+
+# Get site audits
+@app.get("/sites/{site_id}/audits", response_model=List[AuditResponse])
+async def get_site_audits(site_id: str, tenant: dict = Depends(get_current_tenant)):
+    """Get audit history for a site"""
+    # Verify site ownership
+    site = execute_query(
+        "SELECT id FROM sites WHERE id = ? AND tenant_id = ?",
+        (site_id, tenant['id']),
+        fetch=True
+    )
+    
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    
+    results = execute_query(
+        """SELECT id, site_id, score, issues, pages_analyzed, created_at 
+           FROM audits WHERE site_id = ? ORDER BY created_at DESC""",
+        (site_id,),
+        fetch=True
+    )
+    
+    # Log usage
+    log_usage(tenant['id'], 'get_audits', site_id)
+    
+    return [{
+        "id": r[0],
+        "site_id": r[1],
+        "score": r[2],
+        "issues": json.loads(r[3]),
+        "pages_analyzed": r[4],
+        "created_at": r[5]
+    } for r in results]
+
+# Trigger audit
+@app.post("/sites/{site_id}/audit")
+async def trigger_audit(
+    site_id: str,
+    background_tasks: BackgroundTasks,
+    tenant: dict = Depends(get_current_tenant)
+):
+    """Manually trigger an audit"""
+    site = execute_query(
+        "SELECT url FROM sites WHERE id = ? AND tenant_id = ?",
+        (site_id, tenant['id']),
+        fetch=True
+    )
+    
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    
+    # Log usage
+    log_usage(tenant['id'], 'trigger_audit', site_id)
+    
+    # Run audit in background
+    background_tasks.add_task(run_audit, site_id, site[0][0], tenant['id'])
+    
+    return {"message": "Audit started", "site_id": site_id}
+
+# Get usage
+@app.get("/usage", response_model=UsageResponse)
+async def get_usage(tenant: dict = Depends(get_current_tenant)):
+    """Get detailed usage with billing info"""
+    from tenant import get_tenant_statistics
+    
+    stats = get_tenant_statistics(tenant['id'])
     billing_end = datetime.fromisoformat(tenant['billing_end'])
     days_left = (billing_end - datetime.now()).days
     percentage_used = (tenant['usage_count'] / tenant['rate_limit'] * 100) if tenant['rate_limit'] > 0 else 0
@@ -242,6 +373,9 @@ async def get_usage(tenant: dict = Depends(get_tenant)):
     overage = None
     if tenant['usage_count'] > tenant['rate_limit'] * 0.8:  # Show estimate if >80% used
         overage = calculate_overage_charges(tenant['id'])
+    
+    # Log usage
+    log_usage(tenant['id'], 'check_usage')
     
     return {
         "tenant_id": tenant['id'],
@@ -254,13 +388,14 @@ async def get_usage(tenant: dict = Depends(get_tenant)):
         "rate_limit": tenant['rate_limit'],
         "remaining": max(0, tenant['rate_limit'] - tenant['usage_count']),
         "percentage_used": round(percentage_used, 2),
-        "total_sites": stats['total_sites'],
-        "total_audits": stats['total_audits'],
+        "total_sites": stats['sites']['total'],
+        "total_audits": stats['audits']['total'],
         "estimated_overage": overage if overage and overage['overage'] > 0 else None
     }
 
+# Get billing history
 @app.get("/billing/history", response_model=List[BillingHistoryResponse])
-async def get_billing_history(tenant: dict = Depends(get_tenant)):
+async def get_billing_history(tenant: dict = Depends(get_current_tenant)):
     """Get billing history for tenant"""
     history = execute_query(
         """SELECT cycle_start, cycle_end, usage, overage, status, payment_date 
@@ -274,12 +409,9 @@ async def get_billing_history(tenant: dict = Depends(get_tenant)):
     result = []
     for h in history:
         # Get plan overage rate
-        plan = execute_query(
-            "SELECT overage_rate FROM plans WHERE id = ?",
-            (tenant['plan_type'],),
-            fetch=True
-        )
-        overage_rate = plan[0][0] if plan else 0
+        from tenant import PLAN_LIMITS
+        plan = PLAN_LIMITS.get(tenant['plan_type'], PLAN_LIMITS['free'])
+        overage_rate = plan['overage_rate']
         overage_charge = (h[3] * overage_rate / 100) if h[3] > 0 else 0
         
         result.append({
@@ -294,9 +426,47 @@ async def get_billing_history(tenant: dict = Depends(get_tenant)):
     
     return result
 
+# Dashboard
+@app.get("/dashboard")
+async def get_dashboard(tenant: dict = Depends(get_current_tenant)):
+    """Get tenant dashboard"""
+    from tenant import get_tenant_statistics, check_usage_alerts, get_tenant_audits
+    
+    stats = get_tenant_statistics(tenant['id'])
+    alerts = check_usage_alerts(tenant['id'])
+    recent = get_tenant_audits(tenant['id'], 5)
+    
+    # Calculate days left in billing cycle
+    billing_end = datetime.fromisoformat(tenant['billing_end'])
+    days_left = (billing_end - datetime.now()).days
+    
+    # Log usage
+    log_usage(tenant['id'], 'view_dashboard')
+    
+    return {
+        "tenant": tenant['name'],
+        "plan": tenant['plan_type'],
+        "billing": {
+            "cycle": tenant['billing_cycle'],
+            "billing_end": tenant['billing_end'],
+            "days_left": max(0, days_left)
+        },
+        "usage": {
+            "current": tenant['usage_count'],
+            "limit": tenant['rate_limit'],
+            "remaining": max(0, tenant['rate_limit'] - tenant['usage_count']),
+            "percentage": round(tenant['usage_count'] / tenant['rate_limit'] * 100, 2) if tenant['rate_limit'] > 0 else 0
+        },
+        "total_sites": stats['sites']['total'],
+        "average_score": stats['audits']['average_score'],
+        "recent_audits": recent[:5],
+        "alerts": alerts
+    }
+
+# Update plan (admin only)
 @app.post("/tenants/{tenant_id}/plan")
 async def update_plan(
-    tenant_id: str, 
+    tenant_id: str,
     plan: PlanUpdateRequest,
     admin_key: str = Header(...)
 ):
@@ -304,41 +474,34 @@ async def update_plan(
     if admin_key != "admin_secret_key":
         raise HTTPException(status_code=403, detail="Unauthorized")
     
-    success = update_tenant_plan(tenant_id, plan.plan_type, plan.billing_cycle)
+    from tenant import change_tenant_plan
+    success = change_tenant_plan(tenant_id, plan.plan_type, plan.billing_cycle)
     
     if not success:
         raise HTTPException(status_code=400, detail="Invalid plan")
     
-    # Reset billing cycle if changed
-    if plan.billing_cycle:
-        from models import initialize_tenant_billing
-        initialize_tenant_billing(tenant_id, plan.plan_type, plan.billing_cycle)
-    
     return {"message": "Plan updated", "tenant_id": tenant_id, "plan": plan.plan_type}
 
+# Manual reset (admin only)
 @app.post("/billing/reset")
 async def manual_reset(admin_key: str = Header(...)):
-    """Manually reset all billing cycles (admin only - for testing)"""
+    """Manually reset all billing cycles (admin only)"""
     if admin_key != "admin_secret_key":
         raise HTTPException(status_code=403, detail="Unauthorized")
     
-    from models import check_and_reset_usage
+    from tenant import reset_all_tenants_usage
+    result = reset_all_tenants_usage()
     
-    # Get all tenants
-    tenants = execute_query("SELECT id FROM tenants", fetch=True)
-    
-    for tenant in tenants:
-        check_and_reset_usage(tenant[0])
-    
-    return {"message": f"Reset {len(tenants)} tenants"}
+    return {"message": f"Reset {result['reset_count']} tenants"}
 
-# Background task (updated)
+# Background task for audit
 def run_audit(site_id: str, url: str, tenant_id: str):
     """Run SEO audit in background"""
     try:
+        from tenant import check_tenant_rate_limit
+        
         # Check usage before proceeding
-        from models import check_rate_limit
-        allowed, _ = check_rate_limit(tenant_id)
+        allowed, _ = check_tenant_rate_limit(tenant_id)
         
         if not allowed:
             execute_query(
@@ -368,8 +531,8 @@ def run_audit(site_id: str, url: str, tenant_id: str):
         execute_query(
             """INSERT INTO audits (id, site_id, tenant_id, score, issues, pages_analyzed, created_at, billing_cycle)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (audit_id, site_id, tenant_id, analysis['score'], 
-             json.dumps(analysis['issues']), len(pages), 
+            (audit_id, site_id, tenant_id, analysis['score'],
+             json.dumps(analysis['issues']), len(pages),
              datetime.now().isoformat(), current_cycle)
         )
         
@@ -385,163 +548,26 @@ def run_audit(site_id: str, url: str, tenant_id: str):
         # Log usage
         log_usage(tenant_id, 'audit_completed', audit_id)
         
+        print(f"✅ Audit completed for site {site_id}")
+        
     except Exception as e:
         execute_query(
             "UPDATE sites SET status = 'failed' WHERE id = ?",
             (site_id,)
         )
-        print(f"Audit failed for tenant {tenant_id}, site {site_id}: {e}")
+        print(f"❌ Audit failed for tenant {tenant_id}, site {site_id}: {e}")
 
-# Keep existing endpoints
-@app.get("/sites", response_model=List[SiteResponse])
-async def list_sites(tenant: dict = Depends(get_tenant)):
-    results = execute_query(
-        """SELECT id, url, name, tenant_id, created_at, status, last_score, last_audit, audit_count 
-           FROM sites WHERE tenant_id = ? ORDER BY created_at DESC""",
-        (tenant['id'],),
-        fetch=True
-    )
-    
-    return [{
-        "id": r[0],
-        "url": r[1],
-        "name": r[2],
-        "tenant_id": r[3],
-        "created_at": r[4],
-        "status": r[5],
-        "last_score": r[6],
-        "last_audit": r[7],
-        "audit_count": r[8] or 0
-    } for r in results]
-
-@app.get("/sites/{site_id}", response_model=SiteResponse)
-async def get_site(site_id: str, tenant: dict = Depends(get_tenant)):
-    results = execute_query(
-        "SELECT id, url, name, tenant_id, created_at, status, last_score, last_audit, audit_count FROM sites WHERE id = ? AND tenant_id = ?",
-        (site_id, tenant['id']),
-        fetch=True
-    )
-    
-    if not results:
-        raise HTTPException(status_code=404, detail="Site not found")
-    
-    r = results[0]
-    return {
-        "id": r[0],
-        "url": r[1],
-        "name": r[2],
-        "tenant_id": r[3],
-        "created_at": r[4],
-        "status": r[5],
-        "last_score": r[6],
-        "last_audit": r[7],
-        "audit_count": r[8] or 0
-    }
-
-@app.get("/sites/{site_id}/audits", response_model=List[AuditResponse])
-async def get_site_audits(site_id: str, tenant: dict = Depends(get_tenant)):
-    site = execute_query(
-        "SELECT id FROM sites WHERE id = ? AND tenant_id = ?",
-        (site_id, tenant['id']),
-        fetch=True
-    )
-    
-    if not site:
-        raise HTTPException(status_code=404, detail="Site not found")
-    
-    results = execute_query(
-        """SELECT id, site_id, score, issues, pages_analyzed, created_at 
-           FROM audits WHERE site_id = ? ORDER BY created_at DESC""",
-        (site_id,),
-        fetch=True
-    )
-    
-    return [{
-        "id": r[0],
-        "site_id": r[1],
-        "score": r[2],
-        "issues": json.loads(r[3]),
-        "pages_analyzed": r[4],
-        "created_at": r[5]
-    } for r in results]
-
-@app.post("/sites/{site_id}/audit")
-async def trigger_audit(
-    site_id: str, 
-    background_tasks: BackgroundTasks,
-    tenant: dict = Depends(get_tenant)
-):
-    site = execute_query(
-        "SELECT url, audit_count FROM sites WHERE id = ? AND tenant_id = ?",
-        (site_id, tenant['id']),
-        fetch=True
-    )
-    
-    if not site:
-        raise HTTPException(status_code=404, detail="Site not found")
-    
-    log_usage(tenant['id'], 'trigger_audit', site_id)
-    background_tasks.add_task(run_audit, site_id, site[0][0], tenant['id'])
-    
-    return {"message": "Audit started", "site_id": site_id}
-
-@app.get("/dashboard")
-async def get_dashboard(tenant: dict = Depends(get_tenant)):
-    sites = execute_query(
-        "SELECT COUNT(*) FROM sites WHERE tenant_id = ?",
-        (tenant['id'],),
-        fetch=True
-    )
-    
-    avg_score = execute_query(
-        """SELECT AVG(score) FROM audits a 
-           JOIN sites s ON a.site_id = s.id 
-           WHERE s.tenant_id = ?""",
-        (tenant['id'],),
-        fetch=True
-    )
-    
-    recent = execute_query(
-        """SELECT s.name, a.score, a.created_at 
-           FROM audits a 
-           JOIN sites s ON a.site_id = s.id 
-           WHERE s.tenant_id = ? 
-           ORDER BY a.created_at DESC LIMIT 5""",
-        (tenant['id'],),
-        fetch=True
-    )
-    
-    # Calculate days left in billing cycle
-    billing_end = datetime.fromisoformat(tenant['billing_end'])
-    days_left = (billing_end - datetime.now()).days
-    
-    return {
-        "tenant": tenant['name'],
-        "plan": tenant['plan_type'],
-        "billing": {
-            "cycle": tenant['billing_cycle'],
-            "billing_end": tenant['billing_end'],
-            "days_left": max(0, days_left)
-        },
-        "usage": {
-            "current": tenant['usage_count'],
-            "limit": tenant['rate_limit'],
-            "remaining": max(0, tenant['rate_limit'] - tenant['usage_count']),
-            "percentage": round(tenant['usage_count'] / tenant['rate_limit'] * 100, 2) if tenant['rate_limit'] > 0 else 0
-        },
-        "total_sites": sites[0][0] if sites else 0,
-        "average_score": round(avg_score[0][0], 2) if avg_score and avg_score[0][0] else 0,
-        "recent_audits": [{
-            "site": r[0],
-            "score": r[1],
-            "date": r[2]
-        } for r in recent]
-    }
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "service": "AutoSEO Multi-Tenant with Billing"}
-
+# For local development
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# Vercel serverless handler
+import os
+if os.environ.get('VERCEL'):
+    try:
+        from mangum import Mangum
+        handler = Mangum(app)
+    except ImportError:
+        print("⚠️ Mangum not installed. Vercel deployment may fail.")
