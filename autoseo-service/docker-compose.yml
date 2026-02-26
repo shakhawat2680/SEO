@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  autoseo:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./autoseo.db:/app/autoseo.db
+    environment:
+      - ENVIRONMENT=production
+    restart: unless-stopped
