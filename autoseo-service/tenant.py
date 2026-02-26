@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 import calendar
-from models import execute_query, get_connection
+from models import execute_query, get_connection, get_cycle_usage, check_and_reset_usage
 
 # ============================================================================
 # CONSTANTS
@@ -32,7 +32,7 @@ PLAN_LIMITS = {
         'max_pages_per_audit': 500,
         'price_monthly': 29,
         'price_yearly': 290,
-        'overage_rate': 5,  # $5 per 100 additional requests
+        'overage_rate': 5,
         'features': ['basic_seo', 'advanced_seo', 'keyword_tracking', 'api_access', 'pdf_reports']
     },
     'enterprise': {
@@ -41,7 +41,7 @@ PLAN_LIMITS = {
         'max_pages_per_audit': 5000,
         'price_monthly': 99,
         'price_yearly': 990,
-        'overage_rate': 2,  # $2 per 100 additional requests
+        'overage_rate': 2,
         'features': ['all_features', 'white_label', 'team_access', 'priority_support', 'custom_reports']
     }
 }
@@ -103,18 +103,25 @@ class Tenant:
         plan['usage_percentage'] = round((self.usage_count / self.rate_limit * 100), 2) if self.rate_limit > 0 else 0
         return plan
 
-
 def create_tenant(name: str, email: str, plan_type: str = 'free', 
-                  billing_cycle: str = 'monthly') -> dict:
+                  billing_cycle: str = 'monthly') -> Optional[dict]:
     """Create a new tenant"""
     tenant_id = str(uuid.uuid4())
     api_key = generate_api_key()
     api_key_hash = hash_api_key(api_key)
     
-    # Get plan limits
+    # Check if email exists
+    existing = execute_query(
+        "SELECT id FROM tenants WHERE email = ?",
+        (email,),
+        fetch=True
+    )
+    
+    if existing:
+        return None
+    
     plan = PLAN_LIMITS.get(plan_type, PLAN_LIMITS['free'])
     rate_limit = plan['rate_limit']
-    
     now = datetime.now().isoformat()
     
     execute_query(
@@ -126,16 +133,13 @@ def create_tenant(name: str, email: str, plan_type: str = 'free',
          rate_limit, now, 'active', json.dumps({'created_from': 'api'}))
     )
     
-    # Initialize billing
     initialize_tenant_billing(tenant_id, plan_type, billing_cycle)
     
-    # Get created tenant
     tenant = get_tenant_by_id(tenant_id)
     if tenant:
-        tenant['api_key'] = api_key  # Return unhashed key only once
+        tenant['api_key'] = api_key
     
     return tenant
-
 
 def get_tenant_by_id(tenant_id: str) -> Optional[dict]:
     """Get tenant by ID"""
@@ -172,20 +176,6 @@ def get_tenant_by_id(tenant_id: str) -> Optional[dict]:
         'settings': r[15]
     }
 
-
-def get_tenant_by_email(email: str) -> Optional[dict]:
-    """Get tenant by email"""
-    results = execute_query(
-        "SELECT id FROM tenants WHERE email = ?",
-        (email,),
-        fetch=True
-    )
-    
-    if results:
-        return get_tenant_by_id(results[0][0])
-    return None
-
-
 def get_tenant_by_api_key(api_key: str) -> Optional[dict]:
     """Get tenant by API key (hashed)"""
     api_key_hash = hash_api_key(api_key)
@@ -199,7 +189,6 @@ def get_tenant_by_api_key(api_key: str) -> Optional[dict]:
     if results:
         return get_tenant_by_id(results[0][0])
     return None
-
 
 def update_tenant(tenant_id: str, updates: dict) -> bool:
     """Update tenant information"""
@@ -230,7 +219,6 @@ def update_tenant(tenant_id: str, updates: dict) -> bool:
         tuple(params)
     )
     
-    # If plan changed, update rate limit
     if 'plan_type' in updates:
         plan = PLAN_LIMITS.get(updates['plan_type'], PLAN_LIMITS['free'])
         execute_query(
@@ -240,37 +228,24 @@ def update_tenant(tenant_id: str, updates: dict) -> bool:
     
     return True
 
-
 def delete_tenant(tenant_id: str) -> bool:
     """Delete tenant and all associated data"""
     conn = get_connection()
     c = conn.cursor()
     
     try:
-        # Delete audits
         c.execute("DELETE FROM audits WHERE tenant_id = ?", (tenant_id,))
-        
-        # Delete usage logs
         c.execute("DELETE FROM usage_logs WHERE tenant_id = ?", (tenant_id,))
-        
-        # Delete billing history
         c.execute("DELETE FROM billing_history WHERE tenant_id = ?", (tenant_id,))
-        
-        # Delete sites
         c.execute("DELETE FROM sites WHERE tenant_id = ?", (tenant_id,))
-        
-        # Delete tenant
         c.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,))
-        
         conn.commit()
         return True
-        
     except Exception as e:
         conn.rollback()
         raise e
     finally:
         conn.close()
-
 
 def list_tenants(status: Optional[str] = None, plan: Optional[str] = None, 
                  limit: int = 100, offset: int = 0) -> List[dict]:
@@ -299,12 +274,10 @@ def list_tenants(status: Optional[str] = None, plan: Optional[str] = None,
     for r in results:
         tenant = get_tenant_by_id(r[0])
         if tenant:
-            # Remove sensitive data
             tenant.pop('api_key', None)
             tenants.append(tenant)
     
     return tenants
-
 
 # ============================================================================
 # API KEY MANAGEMENT
@@ -314,11 +287,9 @@ def generate_api_key() -> str:
     """Generate a secure API key"""
     return f"aseo_{secrets.token_urlsafe(32)}"
 
-
 def hash_api_key(api_key: str) -> str:
     """Hash API key for storage"""
     return hashlib.sha256(api_key.encode()).hexdigest()
-
 
 def regenerate_api_key(tenant_id: str) -> str:
     """Regenerate API key for tenant"""
@@ -332,7 +303,6 @@ def regenerate_api_key(tenant_id: str) -> str:
     
     return new_api_key
 
-
 def verify_api_key(api_key: str) -> Optional[dict]:
     """Verify API key and return tenant info"""
     if not api_key or not api_key.startswith('aseo_'):
@@ -343,21 +313,16 @@ def verify_api_key(api_key: str) -> Optional[dict]:
     if not tenant:
         return None
     
-    # Check subscription status
     if tenant['subscription_status'] != 'active':
         return {
             'error': 'subscription_inactive',
             'tenant': tenant
         }
     
-    # Check and reset usage if needed
     check_and_reset_tenant_usage(tenant['id'])
-    
-    # Get fresh data
     tenant = get_tenant_by_id(tenant['id'])
     
     return tenant
-
 
 # ============================================================================
 # BILLING AND USAGE
@@ -367,27 +332,23 @@ def get_current_billing_cycle() -> str:
     """Get current billing cycle (YYYY-MM)"""
     return datetime.now().strftime('%Y-%m')
 
-
 def get_next_billing_date(start_date: str, cycle_type: str = 'monthly') -> str:
     """Calculate next billing date"""
     start = datetime.fromisoformat(start_date)
     
     if cycle_type == 'monthly':
-        # Add one month
         month = start.month + 1
         year = start.year
         if month > 12:
             month = 1
             year += 1
-        # Handle month end
         last_day = calendar.monthrange(year, month)[1]
         day = min(start.day, last_day)
         next_date = start.replace(year=year, month=month, day=day)
-    else:  # yearly
+    else:
         next_date = start.replace(year=start.year + 1)
     
     return next_date.isoformat()
-
 
 def initialize_tenant_billing(tenant_id: str, plan_type: str, billing_cycle: str):
     """Initialize billing for new tenant"""
@@ -402,40 +363,32 @@ def initialize_tenant_billing(tenant_id: str, plan_type: str, billing_cycle: str
         (billing_start, billing_end, now.isoformat(), tenant_id)
     )
 
-
 def check_and_reset_tenant_usage(tenant_id: str):
     """Check if billing cycle ended and reset usage"""
     tenant = get_tenant_by_id(tenant_id)
-    if not tenant or not tenant['billing_end']:
+    if not tenant or not tenant.get('billing_end'):
         return
     
     now = datetime.now()
     billing_end = datetime.fromisoformat(tenant['billing_end'])
     
-    # If current date is past billing end, reset usage
     if now > billing_end:
-        # Archive current cycle usage
         cycle = tenant['billing_start'][:7]
         usage = get_cycle_usage(tenant_id, cycle)
-        
-        # Calculate overage
         overage = max(0, usage - tenant['rate_limit'])
         
-        # Save to billing history
         history_id = str(uuid.uuid4())
         execute_query(
             """INSERT INTO billing_history 
                (id, tenant_id, cycle_start, cycle_end, usage, overage, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (history_id, tenant_id, tenant['billing_start'], 
+            (history_id, tenant_id, tenant['billing_start'],
              tenant['billing_end'], usage, overage, now.isoformat())
         )
         
-        # Start new cycle
         new_start = now.isoformat()
         new_end = get_next_billing_date(new_start, tenant['billing_cycle'])
         
-        # Reset usage
         execute_query(
             """UPDATE tenants 
                SET billing_start = ?, billing_end = ?, last_reset = ?, 
@@ -444,89 +397,26 @@ def check_and_reset_tenant_usage(tenant_id: str):
             (new_start, new_end, now.isoformat(), now.isoformat(), tenant_id)
         )
         
-        # Clean up old logs (keep 3 months)
         three_months_ago = (now - timedelta(days=90)).isoformat()
         execute_query(
             "DELETE FROM usage_logs WHERE tenant_id = ? AND timestamp < ?",
             (tenant_id, three_months_ago)
         )
 
-
 def log_tenant_usage(tenant_id: str, action: str, resource: str = None):
     """Log usage action for tenant"""
-    log_id = str(uuid.uuid4())
-    cycle = get_current_billing_cycle()
-    now = datetime.now().isoformat()
-    
-    execute_query(
-        """INSERT INTO usage_logs 
-           (id, tenant_id, action, resource, timestamp, billing_cycle) 
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (log_id, tenant_id, action, resource, now, cycle)
-    )
-    
-    # Increment tenant usage
-    execute_query(
-        "UPDATE tenants SET usage_count = usage_count + 1, updated_at = ? WHERE id = ?",
-        (now, tenant_id)
-    )
-
+    from models import log_usage as models_log_usage
+    models_log_usage(tenant_id, action, resource)
 
 def get_cycle_usage(tenant_id: str, cycle: str = None) -> int:
     """Get usage for specific billing cycle"""
-    if not cycle:
-        cycle = get_current_billing_cycle()
-    
-    results = execute_query(
-        "SELECT COUNT(*) FROM usage_logs WHERE tenant_id = ? AND billing_cycle = ?",
-        (tenant_id, cycle),
-        fetch=True
-    )
-    
-    return results[0][0] if results else 0
-
+    from models import get_cycle_usage as models_get_cycle_usage
+    return models_get_cycle_usage(tenant_id, cycle)
 
 def check_tenant_rate_limit(tenant_id: str) -> tuple[bool, dict]:
     """Check if tenant has exceeded rate limit"""
-    tenant = get_tenant_by_id(tenant_id)
-    if not tenant:
-        return False, {'error': 'Tenant not found'}
-    
-    # Check subscription
-    if tenant['subscription_status'] != 'active':
-        return False, {
-            'error': 'subscription_inactive',
-            'status': tenant['subscription_status']
-        }
-    
-    # Get current usage
-    current_usage = tenant['usage_count']
-    
-    # Calculate days left
-    now = datetime.now()
-    billing_end = datetime.fromisoformat(tenant['billing_end'])
-    days_left = (billing_end - now).days
-    
-    # Check limit
-    if current_usage >= tenant['rate_limit']:
-        overage = current_usage - tenant['rate_limit']
-        return False, {
-            'error': 'rate_limit_exceeded',
-            'current_usage': current_usage,
-            'limit': tenant['rate_limit'],
-            'overage': overage,
-            'days_left': max(0, days_left),
-            'billing_end': tenant['billing_end']
-        }
-    
-    return True, {
-        'current_usage': current_usage,
-        'limit': tenant['rate_limit'],
-        'remaining': tenant['rate_limit'] - current_usage,
-        'days_left': max(0, days_left),
-        'billing_end': tenant['billing_end']
-    }
-
+    from models import check_rate_limit as models_check_rate_limit
+    return models_check_rate_limit(tenant_id)
 
 # ============================================================================
 # PLAN MANAGEMENT
@@ -536,11 +426,9 @@ def get_available_plans() -> dict:
     """Get all available plans with details"""
     return PLAN_LIMITS
 
-
 def get_plan_details(plan_type: str) -> dict:
     """Get details for specific plan"""
     return PLAN_LIMITS.get(plan_type, PLAN_LIMITS['free'])
-
 
 def change_tenant_plan(tenant_id: str, new_plan: str, 
                        billing_cycle: Optional[str] = None) -> bool:
@@ -560,45 +448,10 @@ def change_tenant_plan(tenant_id: str, new_plan: str,
     
     return update_tenant(tenant_id, updates)
 
-
 def calculate_overage_charges(tenant_id: str, cycle: str = None) -> dict:
     """Calculate overage charges for a billing cycle"""
-    tenant = get_tenant_by_id(tenant_id)
-    if not tenant:
-        return {}
-    
-    if not cycle:
-        cycle = get_current_billing_cycle()
-    
-    usage = get_cycle_usage(tenant_id, cycle)
-    
-    if usage <= tenant['rate_limit']:
-        return {
-            'usage': usage,
-            'limit': tenant['rate_limit'],
-            'overage': 0,
-            'overage_blocks': 0,
-            'rate_per_block': 0,
-            'total_charge': 0
-        }
-    
-    overage = usage - tenant['rate_limit']
-    plan = PLAN_LIMITS.get(tenant['plan_type'], PLAN_LIMITS['free'])
-    overage_rate = plan['overage_rate']
-    
-    # Charge per 100 additional requests
-    overage_blocks = (overage + 99) // 100
-    total_charge = overage_blocks * overage_rate
-    
-    return {
-        'usage': usage,
-        'limit': tenant['rate_limit'],
-        'overage': overage,
-        'overage_blocks': overage_blocks,
-        'rate_per_block': overage_rate,
-        'total_charge': total_charge
-    }
-
+    from models import calculate_overage_charges as models_calc_overage
+    return models_calc_overage(tenant_id, cycle)
 
 # ============================================================================
 # USAGE STATISTICS
@@ -606,145 +459,26 @@ def calculate_overage_charges(tenant_id: str, cycle: str = None) -> dict:
 
 def get_tenant_statistics(tenant_id: str) -> dict:
     """Get comprehensive tenant statistics"""
-    tenant = get_tenant_by_id(tenant_id)
-    if not tenant:
-        return {}
-    
-    # Site stats
-    sites = execute_query(
-        "SELECT COUNT(*) FROM sites WHERE tenant_id = ?",
-        (tenant_id,),
-        fetch=True
-    )
-    
-    # Audit stats
-    audits = execute_query(
-        "SELECT COUNT(*) FROM audits WHERE tenant_id = ?",
-        (tenant_id,),
-        fetch=True
-    )
-    
-    avg_score = execute_query(
-        "SELECT AVG(score) FROM audits WHERE tenant_id = ?",
-        (tenant_id,),
-        fetch=True
-    )
-    
-    # Current cycle usage
-    current_cycle = get_current_billing_cycle()
-    cycle_usage = get_cycle_usage(tenant_id, current_cycle)
-    
-    # Previous cycle
-    last_month = (datetime.now().replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
-    previous_usage = get_cycle_usage(tenant_id, last_month)
-    
-    # Daily activity (last 7 days)
-    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-    daily = execute_query(
-        """SELECT DATE(timestamp) as day, COUNT(*) 
-           FROM usage_logs 
-           WHERE tenant_id = ? AND timestamp > ? 
-           GROUP BY DATE(timestamp)
-           ORDER BY day DESC""",
-        (tenant_id, week_ago),
-        fetch=True
-    )
-    
-    # Top actions
-    top_actions = execute_query(
-        """SELECT action, COUNT(*) as count 
-           FROM usage_logs 
-           WHERE tenant_id = ? 
-           GROUP BY action 
-           ORDER BY count DESC 
-           LIMIT 5""",
-        (tenant_id,),
-        fetch=True
-    )
-    
-    # Billing history
-    history = execute_query(
-        """SELECT cycle_start, cycle_end, usage, overage, status, payment_date 
-           FROM billing_history 
-           WHERE tenant_id = ? 
-           ORDER BY created_at DESC 
-           LIMIT 6""",
-        (tenant_id,),
-        fetch=True
-    )
-    
-    # Calculate usage trends
-    usage_trend = 0
-    if previous_usage > 0:
-        usage_trend = ((cycle_usage - previous_usage) / previous_usage) * 100
-    
-    return {
-        'tenant': {
-            'id': tenant['id'],
-            'name': tenant['name'],
-            'email': tenant['email'],
-            'plan': tenant['plan_type'],
-            'status': tenant['subscription_status']
-        },
-        'sites': {
-            'total': sites[0][0] if sites else 0
-        },
-        'audits': {
-            'total': audits[0][0] if audits else 0,
-            'average_score': round(avg_score[0][0], 2) if avg_score and avg_score[0][0] else 0
-        },
-        'usage': {
-            'current_cycle': current_cycle,
-            'cycle_usage': cycle_usage,
-            'limit': tenant['rate_limit'],
-            'remaining': max(0, tenant['rate_limit'] - cycle_usage),
-            'percentage': round((cycle_usage / tenant['rate_limit'] * 100), 2) if tenant['rate_limit'] > 0 else 0,
-            'previous_cycle': previous_usage,
-            'trend': round(usage_trend, 2)
-        },
-        'activity': {
-            'daily': [{'date': r[0], 'count': r[1]} for r in daily],
-            'top_actions': [{'action': r[0], 'count': r[1]} for r in top_actions]
-        },
-        'billing': {
-            'cycle_start': tenant['billing_start'],
-            'cycle_end': tenant['billing_end'],
-            'days_left': max(0, (datetime.fromisoformat(tenant['billing_end']) - datetime.now()).days),
-            'history': [{
-                'period': f"{r[0][:7]} to {r[1][:7]}",
-                'usage': r[2],
-                'overage': r[3],
-                'status': r[4],
-                'payment_date': r[5]
-            } for r in history]
-        }
-    }
-
+    from models import get_tenant_stats
+    return get_tenant_stats(tenant_id)
 
 def get_all_tenants_statistics() -> dict:
     """Get statistics across all tenants (admin)"""
-    # Total tenants
     total = execute_query("SELECT COUNT(*) FROM tenants", fetch=True)
     
-    # By plan
     by_plan = execute_query(
         "SELECT plan_type, COUNT(*) FROM tenants GROUP BY plan_type",
         fetch=True
     )
     
-    # By status
     by_status = execute_query(
         "SELECT subscription_status, COUNT(*) FROM tenants GROUP BY subscription_status",
         fetch=True
     )
     
-    # Total usage
     total_usage = execute_query("SELECT SUM(usage_count) FROM tenants", fetch=True)
-    
-    # Average usage
     avg_usage = execute_query("SELECT AVG(usage_count) FROM tenants", fetch=True)
     
-    # New tenants this month
     month_start = datetime.now().replace(day=1).isoformat()
     new_this_month = execute_query(
         "SELECT COUNT(*) FROM tenants WHERE created_at > ?",
@@ -764,7 +498,6 @@ def get_all_tenants_statistics() -> dict:
             'new_this_month': new_this_month[0][0] if new_this_month else 0
         }
     }
-
 
 # ============================================================================
 # SITE MANAGEMENT FOR TENANTS
@@ -790,7 +523,6 @@ def get_tenant_sites(tenant_id: str) -> List[dict]:
         'audit_count': r[7] or 0
     } for r in results]
 
-
 def can_add_site(tenant_id: str) -> tuple[bool, str]:
     """Check if tenant can add another site"""
     tenant = get_tenant_by_id(tenant_id)
@@ -799,14 +531,12 @@ def can_add_site(tenant_id: str) -> tuple[bool, str]:
     
     plan = PLAN_LIMITS.get(tenant['plan_type'], PLAN_LIMITS['free'])
     max_sites = plan['max_sites']
-    
     current_sites = len(get_tenant_sites(tenant_id))
     
     if current_sites >= max_sites:
         return False, f"Maximum sites limit ({max_sites}) reached for {tenant['plan_type']} plan"
     
     return True, "OK"
-
 
 def get_tenant_audits(tenant_id: str, limit: int = 50) -> List[dict]:
     """Get recent audits for tenant"""
@@ -830,7 +560,6 @@ def get_tenant_audits(tenant_id: str, limit: int = 50) -> List[dict]:
         'created_at': r[5]
     } for r in results]
 
-
 # ============================================================================
 # BILLING HISTORY
 # ============================================================================
@@ -849,7 +578,6 @@ def get_billing_history(tenant_id: str, limit: int = 12) -> List[dict]:
     
     history = []
     for r in results:
-        # Calculate overage charge
         overage_charge = 0
         if r[3] > 0:
             plan = PLAN_LIMITS.get(get_tenant_by_id(tenant_id)['plan_type'], PLAN_LIMITS['free'])
@@ -870,22 +598,18 @@ def get_billing_history(tenant_id: str, limit: int = 12) -> List[dict]:
     
     return history
 
-
 def generate_invoice(tenant_id: str, cycle: str) -> dict:
     """Generate invoice for a billing cycle"""
     tenant = get_tenant_by_id(tenant_id)
     if not tenant:
         return {}
     
-    # Get cycle data
     usage = get_cycle_usage(tenant_id, cycle)
     plan = PLAN_LIMITS.get(tenant['plan_type'], PLAN_LIMITS['free'])
     
-    # Calculate charges
     base_charge = plan['price_monthly'] if tenant['billing_cycle'] == 'monthly' else plan['price_yearly']
     overage_data = calculate_overage_charges(tenant_id, cycle)
     
-    # Get cycle dates
     cycle_start = f"{cycle}-01"
     last_day = calendar.monthrange(int(cycle[:4]), int(cycle[5:7]))[1]
     cycle_end = f"{cycle}-{last_day}"
@@ -918,7 +642,6 @@ def generate_invoice(tenant_id: str, cycle: str) -> dict:
     
     return invoice
 
-
 # ============================================================================
 # ALERTS AND NOTIFICATIONS
 # ============================================================================
@@ -932,7 +655,6 @@ def check_usage_alerts(tenant_id: str) -> List[dict]:
     alerts = []
     usage_percentage = (tenant['usage_count'] / tenant['rate_limit'] * 100) if tenant['rate_limit'] > 0 else 0
     
-    # Alert at 80% usage
     if usage_percentage >= 80 and usage_percentage < 90:
         alerts.append({
             'type': 'warning',
@@ -940,7 +662,6 @@ def check_usage_alerts(tenant_id: str) -> List[dict]:
             'action': 'Consider upgrading your plan'
         })
     
-    # Alert at 90% usage
     if usage_percentage >= 90 and usage_percentage < 100:
         alerts.append({
             'type': 'urgent',
@@ -948,7 +669,6 @@ def check_usage_alerts(tenant_id: str) -> List[dict]:
             'action': 'Upgrade now to avoid service interruption'
         })
     
-    # Alert at 100% usage
     if usage_percentage >= 100:
         alerts.append({
             'type': 'critical',
@@ -956,7 +676,6 @@ def check_usage_alerts(tenant_id: str) -> List[dict]:
             'action': 'Upgrade your plan or wait for next billing cycle'
         })
     
-    # Check days left in cycle
     days_left = max(0, (datetime.fromisoformat(tenant['billing_end']) - datetime.now()).days)
     if days_left <= 3 and usage_percentage > 50:
         alerts.append({
@@ -966,7 +685,6 @@ def check_usage_alerts(tenant_id: str) -> List[dict]:
         })
     
     return alerts
-
 
 # ============================================================================
 # ADMIN FUNCTIONS
@@ -980,7 +698,6 @@ def reset_all_tenants_usage():
         check_and_reset_tenant_usage(tenant[0])
     
     return {'reset_count': len(tenants)}
-
 
 def apply_plan_updates_to_all():
     """Apply plan limit updates to all tenants (admin)"""
@@ -996,7 +713,6 @@ def apply_plan_updates_to_all():
         updated += 1
     
     return {'updated': updated}
-
 
 def get_revenue_report(start_date: str, end_date: str) -> dict:
     """Generate revenue report for date range"""
@@ -1019,7 +735,6 @@ def get_revenue_report(start_date: str, end_date: str) -> dict:
         }
         total_revenue += r[2] or 0
     
-    # Add overage revenue
     overage = execute_query(
         """SELECT SUM(overage) as total_overage
            FROM billing_history
