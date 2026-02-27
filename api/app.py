@@ -11,6 +11,11 @@ def home():
 
 @app.post("/analyze")
 def analyze(url: str = None, payload: dict = None, tenant=Depends(verify_api_key)):
+    """
+    Hybrid mode:
+    - url → Auto SEO Engine
+    - payload → legacy analyzer
+    """
     engine = AutoSEOEngine(tenant_id=tenant)
 
     if url:
