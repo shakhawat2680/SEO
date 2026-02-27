@@ -3,7 +3,6 @@ from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
-
 class Audit(Base):
     __tablename__ = "audits"
 
