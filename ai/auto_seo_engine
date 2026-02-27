@@ -1,0 +1,23 @@
+from analyzer import analyze_seo
+
+class AutoSEOEngine:
+
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+
+    def run(self, url: str):
+        # Future crawler hook
+        data = {
+            "title": "",
+            "meta_description": "",
+            "word_count": 0,
+            "internal_links": []
+        }
+
+        legacy = analyze_seo(data)
+
+        return {
+            "url": url,
+            "legacy": legacy,
+            "message": "Engine placeholder (crawler not active)"
+        }
