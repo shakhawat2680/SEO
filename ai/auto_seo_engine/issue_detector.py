@@ -1,4 +1,9 @@
 class IssueDetector:
 
     def detect(self, data):
-        return []
+        issues = []
+
+        if not data.get("title"):
+            issues.append({"type": "missing_title", "penalty": 20})
+
+        return issues
