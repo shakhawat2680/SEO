@@ -1,6 +1,6 @@
 class Tenant:
-    def __init__(self, name, plan="free", limit=100):
-        self.name = name
+    def __init__(self, tenant_id: str, plan="free", limit=100):
+        self.tenant_id = tenant_id
         self.plan = plan
         self.limit = limit
         self.usage = 0
